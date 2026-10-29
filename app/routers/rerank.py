@@ -21,9 +21,10 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from app.deps import resolve_model, verify_api_key
+from app.deps import apply_default_params, resolve_model, verify_api_key
 from app.proxy import ProxyResult, forward_safe
 from app.registry import ModelEntry
+from app.routers.openai import raw_body
 from app.schemas import RerankRequest, ScoreRequest
 from app.stats import RequestStat, tracker
 
@@ -299,6 +300,7 @@ async def rerank(body: RerankRequest, request: Request):
         vllm_payload = body.to_vllm_payload()
         # Rewrite model to backend name
         vllm_payload["model"] = model.backend_model
+        vllm_payload = apply_default_params(model, vllm_payload)
 
         result = await forward_safe(model, "/rerank", vllm_payload)
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -351,6 +353,8 @@ async def rerank(body: RerankRequest, request: Request):
             "documents": batch_docs,
         }
         # For batches, don't apply top_n per-batch — we merge and apply globally
+        batch_payload = apply_default_params(model, batch_payload)
+        batch_payload.pop("top_n", None)
         batches.append((i, batch_payload))
 
     # Execute batches concurrently (with limited parallelism)
@@ -449,7 +453,7 @@ async def score(body: ScoreRequest, request: Request):
     Accepts vLLM's /score format with text_1 / text_2 pairs.
     """
     model, payload = resolve_model(
-        body.model_dump(exclude_none=True),
+        await raw_body(request),
         allowed_types=_SCORE_TYPES,
     )
 

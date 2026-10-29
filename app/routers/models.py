@@ -1,10 +1,14 @@
-"""Model management — CRUD endpoints that persist to models.json."""
+"""Model management — CRUD endpoints that persist to models.json.
 
-import time
+Listing is open to every API key; the backend location (URL, backend model
+name, default_params) is shown only to admin callers. Add / update / delete
+need the admin key (ADMIN_API_KEY, or API_KEY when no admin key is set).
+backend_api_key is write-only — it is never returned.
+"""
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.deps import verify_api_key
+from app.deps import caller_is_admin, verify_admin_key, verify_api_key
 from app.registry import ModelCreate, ModelUpdate, registry
 
 router = APIRouter(
@@ -13,61 +17,49 @@ router = APIRouter(
 
 
 @router.get("")
-async def list_models():
+async def list_models(admin: bool = Depends(caller_is_admin)):
     """OpenAI-compatible GET /v1/models."""
-    data = []
-    for m in registry.list_all():
-        data.append(
-            {
-                "id": m.id,
-                "object": "model",
-                "created": m.created_at,
-                "owned_by": m.owned_by,
-                "name": m.name,
-                "model_type": m.model_type,
-                "backend_url": m.backend_url,
-            }
-        )
+    data = [m.public_view(include_backend=admin) for m in registry.list_all()]
     return {"object": "list", "data": data}
 
 
 @router.get("/{model_id}")
-async def get_model(model_id: str):
+async def get_model(model_id: str, admin: bool = Depends(caller_is_admin)):
     entry = registry.get(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-    return {
-        "id": entry.id,
-        "object": "model",
-        "created": entry.created_at,
-        "owned_by": entry.owned_by,
-        "name": entry.name,
-        "model_type": entry.model_type,
-        "backend_url": entry.backend_url,
-    }
+    return entry.public_view(include_backend=admin)
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(verify_admin_key)])
 async def add_model(body: ModelCreate):
     """Add a new model at runtime — saved to models.json immediately."""
     try:
         entry = await registry.add(body)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return {"message": f"Model '{entry.id}' added", "model": entry.model_dump()}
+    return {
+        "message": f"Model '{entry.id}' added",
+        "model": entry.public_view(include_backend=True),
+    }
 
 
-@router.patch("/{model_id}")
+@router.patch("/{model_id}", dependencies=[Depends(verify_admin_key)])
 async def update_model(model_id: str, body: ModelUpdate):
     """Update an existing model's fields."""
     try:
         entry = await registry.update(model_id, body)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    return {"message": f"Model '{entry.id}' updated", "model": entry.model_dump()}
+    except ValueError as exc:  # merged entry failed validation
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {
+        "message": f"Model '{entry.id}' updated",
+        "model": entry.public_view(include_backend=True),
+    }
 
 
-@router.delete("/{model_id}")
+@router.delete("/{model_id}", dependencies=[Depends(verify_admin_key)])
 async def delete_model(model_id: str):
     """Remove a model — takes effect immediately."""
     try:

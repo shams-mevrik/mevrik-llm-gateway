@@ -18,7 +18,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.deps import verify_api_key
+from app.deps import verify_admin_key, verify_api_key
 from app.proxy import forward, forward_stream
 from app.registry import registry
 from app.stats import RequestStat, tracker
@@ -31,12 +31,34 @@ router = APIRouter(
 
 _TEST_PROMPT = "Say 'hello' in one sentence."
 
+# Tests send /chat/completions — other model types cannot be benchmarked here
+_BENCH_TYPES = {"chat"}
+
+# Strong references so running load tests are not garbage-collected
+_background_tasks: set[asyncio.Task] = set()
+
 # ---------------------------------------------------------------------------
 # Job store (in-memory, capped)
 # ---------------------------------------------------------------------------
 _MAX_JOBS = 200
 
 _jobs: dict[str, dict] = {}
+
+
+def _benchmark_entry(model_id: str):
+    """Look up a model and check it can be benchmarked."""
+    entry = registry.get(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    if entry.model_type not in _BENCH_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{model_id}' is type '{entry.model_type}'; "
+                f"benchmarks support {sorted(_BENCH_TYPES)} models only"
+            ),
+        )
+    return entry
 
 
 def _store_job(job_id: str, data: dict):
@@ -68,9 +90,7 @@ class LoadTestRequest(BaseModel):
 @router.post("/models/{model_id}/test")
 async def test_model(model_id: str, body: TestRequest):
     """Single request — measure latency, TTFB, tokens/sec."""
-    entry = registry.get(model_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    entry = _benchmark_entry(model_id)
 
     payload = {
         "model": entry.backend_model,
@@ -120,12 +140,14 @@ async def test_model(model_id: str, body: TestRequest):
 # ---------------------------------------------------------------------------
 # 2. Load test (background job — returns immediately)
 # ---------------------------------------------------------------------------
-@router.post("/models/{model_id}/loadtest", status_code=202)
+@router.post(
+    "/models/{model_id}/loadtest",
+    status_code=202,
+    dependencies=[Depends(verify_admin_key)],
+)
 async def load_test_model(model_id: str, body: LoadTestRequest):
     """Start a load test in the background. Returns a job_id to poll."""
-    entry = registry.get(model_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    entry = _benchmark_entry(model_id)
 
     job_id = str(uuid.uuid4())[:8]
     _store_job(
@@ -140,7 +162,9 @@ async def load_test_model(model_id: str, body: LoadTestRequest):
     )
 
     # Fire and forget — runs in the event loop background
-    asyncio.create_task(_run_loadtest(job_id, entry, body))
+    task = asyncio.create_task(_run_loadtest(job_id, entry, body))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "job_id": job_id,
@@ -289,7 +313,7 @@ async def list_stat_users():
     return {"users": tracker.all_users()}
 
 
-@router.delete("/stats")
+@router.delete("/stats", dependencies=[Depends(verify_admin_key)])
 async def clear_stats(
     user: Optional[str] = Query(
         None, description="Clear stats for specific user, or all if omitted"
@@ -319,8 +343,13 @@ def _count_tokens_from_sse(raw: str) -> int:
             if usage and usage.get("completion_tokens"):
                 return usage["completion_tokens"]
             for choice in obj.get("choices", []):
-                delta = choice.get("delta", {})
-                if delta.get("content"):
+                delta = choice.get("delta") or {}
+                # reasoning models stream thinking separately from content
+                if (
+                    delta.get("content")
+                    or delta.get("reasoning_content")
+                    or delta.get("reasoning")
+                ):
                     count += 1
         except (_json.JSONDecodeError, TypeError):
             continue

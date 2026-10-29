@@ -1,0 +1,36 @@
+[
+  {
+    "id": "my-chat-model",
+    "name": "My Chat Model",
+    "backend_url": "http://<gpu-host>:8010/v1",
+    "backend_model": "generation",
+    "model_type": "chat",
+    "owned_by": "organization",
+    "default_params": {"chat_template_kwargs": {"enable_thinking": false}}
+  },
+  {
+    "id": "my-embedding-model",
+    "name": "My Embedding Model",
+    "backend_url": "http://<gpu-host>:8012/v1",
+    "backend_model": "embedding",
+    "model_type": "embedding",
+    "owned_by": "organization"
+  },
+  {
+    "id": "my-reranker",
+    "name": "My Reranker",
+    "backend_url": "http://<gpu-host>:8030/v1",
+    "backend_model": "rerank",
+    "model_type": "rerank",
+    "owned_by": "organization"
+  },
+  {
+    "id": "my-classifier",
+    "name": "My Classifier",
+    "backend_url": "http://<gpu-host>:8011/v1",
+    "backend_model": "decision",
+    "model_type": "classify",
+    "owned_by": "organization",
+    "default_params": {"truncation_side": "right"}
+  }
+]
