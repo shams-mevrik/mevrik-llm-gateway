@@ -16,6 +16,9 @@ class Settings(BaseSettings):
 
     # Auth
     api_key: str = ""
+    # Optional separate key for model management (add/update/delete), load
+    # tests, stats reset and backend details. Empty = API_KEY has full access.
+    admin_api_key: str = ""
 
     # Server
     host: str = "0.0.0.0"
@@ -30,6 +33,8 @@ class Settings(BaseSettings):
     # Proxy tuning
     request_timeout: int = 300
     max_connections: int = 500
+    # Timeout for each backend probe in GET /health/backends
+    health_timeout: float = 5.0
 
     # Data paths
     data_dir: str = "data"
@@ -47,6 +52,7 @@ class Settings(BaseSettings):
     def ensure_dirs(self):
         """Create data directories on startup."""
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.models_path).parent.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

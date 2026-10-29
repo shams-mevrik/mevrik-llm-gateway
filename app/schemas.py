@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ChatMessage(BaseModel):
@@ -51,6 +51,41 @@ class EmbeddingRequest(BaseModel):
     encoding_format: Optional[str] = None
 
     model_config = ConfigDict(extra="allow")
+
+
+# ---------------------------------------------------------------------------
+# Classification / pooling — vLLM /classify and /pooling
+# ---------------------------------------------------------------------------
+
+
+class ClassifyRequest(BaseModel):
+    """vLLM sequence-classification request (``POST /classify``).
+
+    vLLM accepts:
+      - input: str | list[str] | list[int] | list[list[int]]
+      - or messages: chat-style list (scored through the chat template)
+      - truncate_prompt_tokens / truncation_side ("left" | "right"),
+        use_activation, add_special_tokens, priority, ...
+
+    The response carries one ``data`` row per input with ``probs`` in the
+    model's label-id order (config.json id2label).
+    """
+
+    model: str
+    input: Optional[Union[str, List[str], List[int], List[List[int]]]] = None
+    messages: Optional[List[Any]] = None
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="after")
+    def _input_or_messages(self) -> "ClassifyRequest":
+        if self.input is None and self.messages is None:
+            raise ValueError("Request must include 'input' or 'messages'")
+        return self
+
+
+class PoolingRequest(ClassifyRequest):
+    """vLLM raw pooling request (``POST /pooling``) — same input shapes."""
 
 
 # ---------------------------------------------------------------------------

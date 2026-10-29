@@ -1,14 +1,19 @@
 """OpenAI-compatible proxy endpoints — forwards to vLLM backends.
 
 Pure pass-through proxy. Every endpoint:
- 1. Resolves the gateway model-id → backend entry + rewritten payload.
- 2. Validates the model type matches the endpoint.
- 3. Proxies the request via forward_safe (non-streaming) or
-    forward_stream (streaming SSE).
- 4. Records per-user stats (latency, tokens, throughput).
- 5. Returns the backend response as-is — errors included.
+ 1. Validates the body against a minimal schema, then forwards the JSON
+    exactly as the client sent it (no fields dropped or added).
+ 2. Resolves the gateway model-id → backend entry + rewritten payload
+    (backend model name, plus the model's default_params).
+ 3. Validates the model type matches the endpoint.
+ 4. Proxies the request via forward_safe (non-streaming) or
+    open_stream (streaming SSE — the backend status is checked first, so
+    a rejected request returns the backend's real status and message).
+ 5. Records per-user stats (latency, tokens, throughput).
+ 6. Returns the backend response as-is — errors included.
 
-Note: /rerank and /score are handled by app.routers.rerank.
+Note: /rerank and /score are handled by app.routers.rerank,
+/classify and /pooling by app.routers.pooling.
 """
 
 from __future__ import annotations
@@ -17,11 +22,12 @@ import json
 import logging
 import time
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.deps import resolve_model, verify_api_key
-from app.proxy import ProxyResult, forward_safe, forward_stream
+from app.proxy import ProxyResult, StreamHandle, forward_safe, open_stream
 from app.registry import ModelEntry
 from app.schemas import (
     ChatCompletionRequest,
@@ -46,6 +52,21 @@ _SSE_HEADERS = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+async def raw_body(request: Request) -> dict:
+    """The request JSON exactly as sent (the typed body is for validation/docs)."""
+    try:
+        data = await request.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="Request body must be valid JSON"
+        ) from None
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=400, detail="Request body must be a JSON object"
+        )
+    return data
+
+
 def _user_key(request: Request) -> str:
     """Extract a user identifier from the Authorization header for stats."""
     auth = request.headers.get("authorization", "")
@@ -177,21 +198,50 @@ async def _proxy_json(
 # ---------------------------------------------------------------------------
 # Streaming proxy
 # ---------------------------------------------------------------------------
-async def _proxy_stream(
+async def _start_stream(
     request: Request,
     model: ModelEntry,
     path: str,
     payload: dict,
 ):
-    """Proxy a streaming SSE request, wrap errors into SSE events."""
-    user = _user_key(request)
+    """Open the backend stream; return its error as JSON if it refused."""
     t0 = time.perf_counter()
+    handle = await open_stream(model, path, payload)
+    if isinstance(handle, ProxyResult):
+        logger.warning(
+            "Proxy error [%s] %s → %d (%s) %.0fms",
+            model.id,
+            path,
+            handle.status_code,
+            handle.error or "backend error",
+            (time.perf_counter() - t0) * 1000,
+        )
+        return _error_response(handle)
+
+    return StreamingResponse(
+        _proxy_stream(request, model, path, handle, t0),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+        # Frees the backend slot even if the body is never iterated
+        background=BackgroundTask(handle.aclose),
+    )
+
+
+async def _proxy_stream(
+    request: Request,
+    model: ModelEntry,
+    path: str,
+    handle: StreamHandle,
+    t0: float,
+):
+    """Relay an open SSE stream, wrap mid-stream errors into SSE events."""
+    user = _user_key(request)
     first_chunk = True
     ttfb_ms = 0.0
     chunk_count = 0
 
     try:
-        async for chunk in forward_stream(model, path, payload):
+        async for chunk in handle.iter_bytes():
             if first_chunk:
                 ttfb_ms = (time.perf_counter() - t0) * 1000
                 first_chunk = False
@@ -211,7 +261,10 @@ async def _proxy_stream(
         err = json.dumps(
             {
                 "error": {
-                    "message": str(exc),
+                    "message": (
+                        f"Backend stream for model '{model.id}' was interrupted "
+                        f"({type(exc).__name__})"
+                    ),
                     "type": "proxy_error",
                     "code": 502,
                 }
@@ -231,16 +284,12 @@ async def _proxy_stream(
 @router.post("/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
     model, payload = resolve_model(
-        body.model_dump(exclude_none=True),
+        await raw_body(request),
         allowed_types={"chat"},
     )
 
     if payload.get("stream"):
-        return StreamingResponse(
-            _proxy_stream(request, model, "/chat/completions", payload),
-            media_type="text/event-stream",
-            headers=_SSE_HEADERS,
-        )
+        return await _start_stream(request, model, "/chat/completions", payload)
 
     return await _proxy_json(request, model, "/chat/completions", payload)
 
@@ -251,16 +300,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 @router.post("/completions")
 async def completions(body: CompletionRequest, request: Request):
     model, payload = resolve_model(
-        body.model_dump(exclude_none=True),
+        await raw_body(request),
         allowed_types={"completion", "chat"},
     )
 
     if payload.get("stream"):
-        return StreamingResponse(
-            _proxy_stream(request, model, "/completions", payload),
-            media_type="text/event-stream",
-            headers=_SSE_HEADERS,
-        )
+        return await _start_stream(request, model, "/completions", payload)
 
     return await _proxy_json(request, model, "/completions", payload)
 
@@ -271,7 +316,7 @@ async def completions(body: CompletionRequest, request: Request):
 @router.post("/embeddings")
 async def embeddings(body: EmbeddingRequest, request: Request):
     model, payload = resolve_model(
-        body.model_dump(exclude_none=True),
+        await raw_body(request),
         allowed_types={"embedding"},
     )
     return await _proxy_json(request, model, "/embeddings", payload)
